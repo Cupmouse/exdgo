@@ -30,7 +30,7 @@ func setupClientSetting(param ClientParam) (setting clientSetting, err error) {
 	}
 	setting.apikey = param.APIKey
 	if param.Timeout == nil {
-		// set the default value
+		// Set the default value
 		setting.timeout = clientDefaultTimeout
 	} else {
 		if *param.Timeout < 0 {
@@ -42,27 +42,23 @@ func setupClientSetting(param ClientParam) (setting clientSetting, err error) {
 	return
 }
 
+// Client for accessing to Exchangedataset API.
 type Client struct {
 	setting clientSetting
 }
-
-// func (c *Client) Raw(params RawRequestParam) {
-
-// }
 
 // func (c *Client) Replay(params ReplayRequestParam) {
 
 // }
 
 // CreateClient creates new Client and returns pointer to it.
-// func CreateClient(setting ClientSetting) (*Client, error) {
-// 	// Check if API-key provided is in base64 URL formats
-// 	_, serr := base64.RawURLEncoding.DecodeString(apikey)
-// 	if serr != nil {
-// 		return nil, fmt.Errorf("API-key provided is not valid: %v", serr)
-// 	}
-// 	// Create new Client and set API-key
-// 	client := new(Client)
-// 	client.setting.apikey = apikey
-// 	return client, nil
-// }
+func CreateClient(param ClientParam) (*Client, error) {
+	var serr error
+	// Create new Client and set API-key
+	client := new(Client)
+	client.setting, serr = setupClientSetting(param)
+	if serr != nil {
+		return nil, serr
+	}
+	return client, nil
+}

@@ -149,7 +149,7 @@ func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err err
 	return
 }
 
-// httpFilter is internal function for requesting Snapshot HTTP Endpoint
+// httpSnapshot is internal function for requesting Snapshot HTTP Endpoint
 // using settings for both client and snapshot.
 func httpSnapshot(ctx context.Context, clientSetting clientSetting, setting snapshotSetting) ([]Snapshot, error) {
 	path := fmt.Sprintf("snapshot/%s/%d", setting.exchange, setting.at)
@@ -302,7 +302,7 @@ func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
 		setting.end = &end
 	}
 	if param.Start != nil && param.End != nil && start >= end {
-		err = errors.New("'start' >= 'end'")
+		err = errors.New("'Start' >= 'End'")
 	}
 	// Optional parameter
 	if param.Format != nil {
