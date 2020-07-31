@@ -79,14 +79,6 @@ func setupRawRequest(cliSetting clientSetting, param RawRequestParam) (*RawReque
 	return req, nil
 }
 
-// rawParallelResult is the result of individual execution of an element in queue
-type rawParallelResult struct {
-	Exchange string
-	Index    int
-	Shard    []StringLine
-	Error    error
-}
-
 // Converts snapshots into lines.
 // This function is called only once per a request so calling this is not that much of a bottleneck.
 func convertSnapshotsToLines(exchange string, snapshots []Snapshot) []StringLine {
@@ -103,66 +95,58 @@ func convertSnapshotsToLines(exchange string, snapshots []Snapshot) []StringLine
 	return converted
 }
 
-// rawParallelHTTPSnapshot call httpSnapshot but can be excecuted in paralell way.
-// `id` is used to distinguish each goroutine.
-func (r RawRequest) rawParallelHTTPSnapshot(ctx context.Context, setting snapshotSetting, id int, wg *sync.WaitGroup, result chan *rawParallelResult) {
-	defer wg.Done()
-	var serr error
-	defer func() {
-		// Check if error was reported
-		if serr != nil {
-			result <- &rawParallelResult{
-				Exchange: setting.exchange,
-				Index:    id,
-				Error:    serr,
-			}
-		}
-	}()
-	defer func() {
-		if perr := recover(); perr != nil {
-			// On case panic happens, serr must be empty
-			serr = fmt.Errorf("goroutine panic: %v", perr)
-		}
-	}()
-	ret, serr := httpSnapshot(ctx, r.cliSetting, setting)
-	if serr != nil {
-		return
-	}
-	// Real struct is too big to send through channel
-	result <- &rawParallelResult{
-		Exchange: setting.exchange,
-		Index:    0,
-		Shard:    convertSnapshotsToLines(setting.exchange, ret),
-	}
+const (
+	rawDownloadJobSnapshot = iota
+	rawDonwloadJobFilter
+)
+
+// rawDownloadJob is the job used in rawDownloadWorker.
+type rawDownloadJob struct {
+	// Type of job.
+	// Snapshot or filter.
+	typ int
+	// Setting for job.
+	setting interface{}
 }
 
-func (r RawRequest) rawParalellHTTPFilter(ctx context.Context, setting filterSetting, id int, wg *sync.WaitGroup, result chan *rawParallelResult) {
-	defer wg.Done()
-	var serr error
-	defer func() {
-		// Check if error was reported
-		if serr != nil {
-			result <- &rawParallelResult{
-				Exchange: setting.exchange,
-				Index:    id,
-				Error:    serr,
+type rawDownloadJobResult struct {
+	job    *rawDownloadJob
+	result []StringLine
+}
+
+// Works on job provided by `jobs` channel.
+// `err` is used for multiple workers, so it won't be closed from worker.
+// Instead, worker will close `stopped` channel to let others know that this worker had stopped.
+func rawDownloadWorker(ctx context.Context, cliSetting clientSetting, jobs chan *rawDownloadJob, results chan *rawDownloadJobResult, err chan error, stopped chan struct{}) {
+	defer close(stopped)
+	// Do job if it can and jobs are available
+	for job := range jobs {
+		if job.typ == rawDownloadJobSnapshot {
+			setting := job.setting.(snapshotSetting)
+			ret, serr := httpSnapshot(ctx, cliSetting, setting)
+			if serr != nil {
+				err <- serr
 			}
+			// Real struct is too big to send through channel
+			results <- &rawDownloadJobResult{
+				job:    job,
+				result: convertSnapshotsToLines(setting.exchange, ret),
+			}
+		} else if job.typ == rawDonwloadJobFilter {
+			setting := job.setting.(filterSetting)
+			ret, serr := httpFilter(ctx, cliSetting, setting)
+			if serr != nil {
+				err <- serr
+			}
+			// Real struct is too big to send through channel
+			results <- &rawDownloadJobResult{
+				job:    job,
+				result: ret,
+			}
+		} else {
+			err <- errors.New("unknown download job type")
+			return
 		}
-	}()
-	defer func() {
-		if perr := recover(); perr != nil {
-			// On case panic happens, serr must be empty
-			serr = fmt.Errorf("goroutine panic: %v", perr)
-		}
-	}()
-	ret, serr := httpFilter(ctx, r.cliSetting, setting)
-	if serr != nil {
-		return
-	}
-	result <- &rawParallelResult{
-		Exchange: setting.exchange,
-		Index:    id,
-		Shard:    ret,
 	}
 }
 
@@ -174,39 +158,70 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 	// Slice to store function to call HTTP Endpoint API
 	// The size is exchanges * (snapshot + filter)
 	shardsPerExchange := 1 + int(endMinute-startMinute+1)
-	callFns := make([]func(context.Context, *sync.WaitGroup, chan *rawParallelResult), len(r.filter)*shardsPerExchange)
-	i := 0
-	for exchange, channels := range r.filter {
-		// Those values have to be preserved to be used later in function
-		exc := exchange
-		chs := channels
+	amountOfJobs := len(r.filter) * shardsPerExchange
 
+	// Channel to get error from worker, used in all workers
+	errCh := make(chan error)
+	defer close(errCh)
+	resultsCh := make(chan *rawDownloadJobResult)
+	defer close(resultsCh)
+	// Context for all worker
+	childCtx, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+	// Worker pool are the slice of channel that gets closed when a worker had stopped
+	workerPool := make([]chan struct{}, concurrency)
+	defer func() {
+		// Defer function prevents worker from being left alone
+		// This will stop http query
+		cancelChild()
+		for _, worker := range workerPool {
+			// Wait for the worker to stop
+			select {
+			case <-worker:
+				// This two are needed to unblock channels so a worker can stop
+				// which not neccesarily the worker that we are waiting for
+			case <-errCh:
+			case <-resultsCh:
+				// Jobs channels are already closed, so we don't have to think about it
+			}
+		}
+	}()
+	// Channel to send workers jobs, it won't get blocked by sending
+	jobsCh := make(chan *rawDownloadJob, amountOfJobs)
+	defer close(jobsCh)
+	// Run all worker
+	for i := 0; i < concurrency; i++ {
+		workerPool[i] = make(chan struct{})
+		go rawDownloadWorker(childCtx, r.cliSetting, jobsCh, resultsCh, errCh, workerPool[i])
+	}
+
+	// Send jobs to worker
+	for exchange, channels := range r.filter {
 		// Take snapshot of channels
-		callFns[i] = func(ctx context.Context, wg *sync.WaitGroup, result chan *rawParallelResult) {
-			r.rawParallelHTTPSnapshot(ctx, snapshotSetting{
-				exchange: exc,
-				channels: chs,
+		// FIXME Can change to blocking one if we use select
+		jobsCh <- &rawDownloadJob{
+			typ: rawDownloadJobSnapshot,
+			setting: snapshotSetting{
+				exchange: exchange,
+				channels: channels,
 				at:       r.start,
 				format:   r.format,
-			}, 0, wg, result)
+			},
 		}
-		i++
 
 		// Download the rest of data
 		for minute := startMinute; minute <= endMinute; minute++ {
-			// Preserve value
-			min := minute
-			callFns[i] = func(ctx context.Context, wg *sync.WaitGroup, result chan *rawParallelResult) {
-				r.rawParalellHTTPFilter(ctx, filterSetting{
-					exchange: exc,
-					channels: chs,
+			jobsCh <- &rawDownloadJob{
+				typ: rawDownloadJobSnapshot,
+				setting: filterSetting{
+					exchange: exchange,
+					channels: channels,
 					start:    &r.start,
 					end:      &r.end,
-					minute:   min,
+					minute:   minute,
 					format:   r.format,
-				}, int(min-startMinute)+1, wg, result)
+				},
 			}
-			i++
 		}
 	}
 
@@ -216,73 +231,28 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 	for exchange := range r.filter {
 		shards[exchange] = make([][]StringLine, shardsPerExchange)
 	}
-	// Waitgroup to wait for all goroutine running
-	var wg sync.WaitGroup
-	// Channel to get result from goroutine
-	resultCh := make(chan *rawParallelResult)
-	defer func() {
-		// Wait for all goroutine to exit
-		wg.Wait()
-	}()
-	// Create child context with cancel function
-	childCtx, cancelChild := context.WithCancel(ctx)
-	defer cancelChild()
 
-	// Run `concurrency` goroutine at maximum
-	// Next index of function in callFuncs to run
-	next := 0
-	// How much goroutine are successfully executed
+	// How many jobs it have done
 	over := 0
-	for ; next < concurrency && next < len(callFns); next++ {
-		// Run goroutine
-		wg.Add(1)
-		go callFns[next](childCtx, &wg, resultCh)
-	}
-	var serr error
-	for over < len(callFns) && serr == nil {
-		// Wait for at least one goroutine to signal done
-		// or for context be cancelled
+	for over >= amountOfJobs {
 		select {
-		case result := <-resultCh:
-			// Execution of a goroutine have finished
+		case result := <-resultsCh:
+			if result.job.typ == rawDownloadJobSnapshot {
+				setting := result.job.setting.(snapshotSetting)
+				shards[setting.exchange][0] = result.result
+			} else if result.job.typ == rawDonwloadJobFilter {
+				setting := result.job.setting.(filterSetting)
+				shards[setting.exchange][setting.minute-startMinute+1] = result.result
+			} else {
+				return nil, errors.New("unknown download job type")
+			}
 			over++
-			if result.Error != nil {
-				// Error is reported by a goroutine
-				// Cancel child context to let all goroutine to stop
-				cancelChild()
-				serr = result.Error
-				// Break from select
-				break
-			}
-			// Store result from goroutine
-			shards[result.Exchange][result.Index] = result.Shard
-			if next < len(callFns) {
-				// There is more work to do, run another goroutine
-				wg.Add(1)
-				go callFns[next](childCtx, &wg, resultCh)
-				next++
-			}
+		case serr := <-errCh:
+			return nil, fmt.Errorf("worker: %v", serr)
 		case <-ctx.Done():
-			// Store why parent context was cancelled
-			serr = ctx.Err()
-			// Child context is also cancelled
+			// Context is cancelled
+			return nil, fmt.Errorf("context done: %v", ctx.Err())
 		}
-	}
-
-	// This will run only if error was reported
-	for over < len(callFns) {
-		// Serves channel message from all goroutine
-		// FIXME Ignoring all error and result
-		<-resultCh
-		over++
-	}
-
-	// Wait for all goroutine to stop
-	wg.Wait()
-
-	if serr != nil {
-		// Error was reported from goroutine
-		return nil, serr
 	}
 
 	return shards, nil
@@ -308,7 +278,7 @@ func (i *rawShardsLineIterator) Next() *StringLine {
 	return &line
 }
 
-type rawIteratorAndLastLine struct {
+type rawDownloadIteratorAndLastLine struct {
 	Iterator *rawShardsLineIterator
 	LastLine *StringLine
 }
@@ -323,7 +293,7 @@ func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([
 		return nil, serr
 	}
 	// Prepare shards line iterator for all exchange
-	states := make(map[string]rawIteratorAndLastLine)
+	states := make(map[string]rawDownloadIteratorAndLastLine)
 	exchanges := make([]string, 0, len(r.filter))
 	for exchange, shards := range mapped {
 		itr := &rawShardsLineIterator{Shards: shards}
@@ -331,7 +301,7 @@ func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([
 		// If next line does not exist, data for this exchange is empty, ignore
 		if nxt != nil {
 			exchanges = append(exchanges, exchange)
-			states[exchange] = rawIteratorAndLastLine{
+			states[exchange] = rawDownloadIteratorAndLastLine{
 				Iterator: itr,
 				LastLine: nxt,
 			}
@@ -385,6 +355,184 @@ func (r RawRequest) DownloadConcurrency(concurrency int) ([]StringLine, error) {
 // Otherwise, slice is non-nil.
 func (r RawRequest) Download() ([]StringLine, error) {
 	return r.DownloadWithContext(context.Background(), downloadBatchSize)
+}
+
+type rawStreamShardSlot struct {
+	// This channel will be closed to notify the goroutine who are responsible to set shard to
+	// this slot is stopped
+	downloaderStopped chan struct{}
+	shard             []StringLine
+}
+
+type rawExchageStreamShardIterator struct {
+	// Must be initilized before init()
+	request *RawRequest
+	// Must be initilized before init()
+	exchange string
+	// Must be initilized before init()
+	buffer   [][]StringLine
+	position int
+	// If set, this channel will get closed by a background goroutine
+	// when the shard on current position is set on the buffer and became available
+	notifier chan struct{}
+	// Lock on the buffer and notifier
+	lock sync.Mutex
+	// Context background goroutine will run on
+	bgCtx context.Context
+	// Function to cancel background context
+	cancelBGCtx func()
+	// Channel to receive error from background goroutine
+	bgerr              chan error
+	nextDownloadMinute int64
+	startMinute        int64
+	endMinute          int64
+}
+
+// downloadSnapshot is a goroutine to download a snapshot shard parallelly
+func (i *rawExchageStreamShardIterator) downloadSnapshot(setPosition int) {
+	result, serr := httpSnapshot(i.bgCtx, i.request.cliSetting, snapshotSetting{
+		exchange: i.exchange,
+		channels: i.request.filter[i.exchange],
+		at:       i.request.start,
+		format:   i.request.format,
+	})
+	if serr != nil {
+		i.bgerr <- serr
+	}
+	// Lock when modify buffer
+	i.lock.Lock()
+	// Ensure unlocking
+	defer i.lock.Unlock()
+	i.buffer[setPosition%len(i.buffer)] = convertSnapshotsToLines(i.exchange, result)
+	if i.position == setPosition && i.notifier != nil {
+		close(i.notifier)
+	}
+}
+
+// downloadSnapshot is a goroutine to download a filter shard parallelly
+func (i *rawExchageStreamShardIterator) downloadFilter(setPosition int, minute int64) {
+	result, serr := httpFilter(i.bgCtx, i.request.cliSetting, filterSetting{
+		exchange: i.exchange,
+		channels: i.request.filter[i.exchange],
+		minute:   minute,
+		start:    &i.request.start,
+		end:      &i.request.end,
+		format:   i.request.format,
+	})
+	if serr != nil {
+		i.bgerr <- serr
+	}
+	// Lock when modify buffer
+	i.lock.Lock()
+	// Ensure unlocking
+	defer i.lock.Unlock()
+	i.buffer[setPosition%len(i.buffer)] = result
+	if i.notifier != nil {
+		close(i.notifier)
+	}
+}
+
+// init initialize this iterator by setting field value and start downloading
+// to fill buffer.
+// Context given will be used by this iterator for its lifetime.
+// This includes `next()` and other operations.
+func (i *rawExchageStreamShardIterator) init(ctx context.Context) {
+	i.startMinute = i.request.start / int64(time.Minute)
+	i.nextDownloadMinute = i.startMinute
+	// End is exclusive
+	i.endMinute = (i.request.end - 1) / int64(time.Minute)
+	i.bgCtx, i.cancelBGCtx = context.WithCancel(ctx)
+	i.bgerr = make(chan error)
+	// Fill the buffer
+	go i.downloadSnapshot(0)
+	for j := 0; j < len(i.buffer)-1; j++ {
+		minute := i.startMinute + int64(j)
+		go i.downloadFilter(j+1, minute)
+		i.nextDownloadMinute++
+	}
+}
+
+// next returns the next shard on this iterator.
+//
+// Returns a shard immediately if it is buffered, if not, it waits for
+// the shard to be available.
+//
+// Returns error if background download goroutines had encountered an error which has not been reported yet.
+//
+// This function runs on the context which was given when an iterator was initialized.
+func (i *rawExchageStreamShardIterator) next() ([]StringLine, error) {
+	minute := i.startMinute + int64(len(i.buffer))
+	if minute > i.endMinute {
+		// No bufferred shard in buffer
+		return nil, nil
+	}
+	// Acquire lock on buffer and notifier
+	i.lock.Lock()
+	if i.buffer[i.position%len(i.buffer)] == nil {
+		// Shard has not been downloaded yet
+		// Set notifier and wait for it
+		i.notifier = make(chan struct{})
+		// Don't forget to unlock
+		i.lock.Unlock()
+		select {
+		case <-i.notifier:
+			i.lock.Lock()
+			// Let go
+		case serr := <-i.bgerr:
+			// Error reported from background
+			return nil, serr
+		}
+	}
+	// At this point, lock is always active
+	defer i.lock.Unlock()
+	shard := i.buffer[i.position]
+	i.position++
+	if i.nextDownloadMinute <= i.endMinute {
+		// It have to buffer more shards
+		go i.downloadFilter(i.position+len(i.buffer), i.nextDownloadMinute)
+		i.nextDownloadMinute++
+	}
+	return shard, nil
+}
+
+// close stops goroutine used by this iterator
+// After non-nil return from the call, this iterator could be
+// safely ignored until gc will take care of them.
+func (i *rawExchageStreamShardIterator) close() error {
+	// Cancelling context will stop goroutine
+	i.cancelBGCtx()
+	// Wait for all goroutine to stop
+
+	// Close channels
+	close(i.bgerr)
+}
+
+type rawExchangeStreamIterator struct {
+	request  *RawRequest
+	shard    []StringLine
+	position int
+}
+
+type rawStreamIteratorAndLastLine struct {
+	iterator rawExchangeStreamIterator
+	lastLine *StringLine
+}
+
+type rawStreamIterator struct {
+	request   *RawRequest
+	state     rawStreamIteratorAndLastLine
+	exchanges []string
+}
+
+func (i rawStreamIterator) next() StringLine {
+	if len(i.exchanges) == 0 {
+
+	}
+}
+
+func newRawStreamIterator(cliSetting clientSetting) {
+	itr := new(rawStreamIterator)
+	itr.cliSetting = cliSetting
 }
 
 // Stream sends request to server and returns iterator to read response.

@@ -101,7 +101,3 @@ type StringLine struct {
 	// Could be `nil` accoring to `type`.
 	Message []byte
 }
-
-func convertTimeToMinute(tm time.Time) time.Time {
-	return tm.Truncate(time.Minute)
-}
