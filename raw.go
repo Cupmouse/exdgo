@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -212,7 +211,7 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 		// Download the rest of data
 		for minute := startMinute; minute <= endMinute; minute++ {
 			jobsCh <- &rawDownloadJob{
-				typ: rawDownloadJobSnapshot,
+				typ: rawDonwloadJobFilter,
 				setting: filterSetting{
 					exchange: exchange,
 					channels: channels,
@@ -232,9 +231,9 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 		shards[exchange] = make([][]StringLine, shardsPerExchange)
 	}
 
-	// How many jobs it have done
+	// How many jobs has been done
 	over := 0
-	for over >= amountOfJobs {
+	for over < amountOfJobs {
 		select {
 		case result := <-resultsCh:
 			if result.job.typ == rawDownloadJobSnapshot {
@@ -259,22 +258,22 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 }
 
 type rawShardsLineIterator struct {
-	Shards        [][]StringLine
-	ShardPosition int
-	Position      int
+	shards        [][]StringLine
+	shardPosition int
+	position      int
 }
 
 func (i *rawShardsLineIterator) Next() *StringLine {
-	for i.ShardPosition < len(i.Shards) && len(i.Shards[i.ShardPosition]) <= i.Position {
+	for i.shardPosition < len(i.shards) && len(i.shards[i.shardPosition]) <= i.position {
 		// This shard is all read
-		i.ShardPosition++
-		i.Position++
+		i.shardPosition++
+		i.position = 0
 	}
-	if i.ShardPosition == len(i.Shards) {
+	if i.shardPosition == len(i.shards) {
 		return nil
 	}
-	line := i.Shards[i.ShardPosition][i.Position]
-	i.Position++
+	line := i.shards[i.shardPosition][i.position]
+	i.position++
 	return &line
 }
 
@@ -293,15 +292,15 @@ func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([
 		return nil, serr
 	}
 	// Prepare shards line iterator for all exchange
-	states := make(map[string]rawDownloadIteratorAndLastLine)
+	states := make(map[string]*rawDownloadIteratorAndLastLine)
 	exchanges := make([]string, 0, len(r.filter))
 	for exchange, shards := range mapped {
-		itr := &rawShardsLineIterator{Shards: shards}
+		itr := &rawShardsLineIterator{shards: shards}
 		nxt := itr.Next()
 		// If next line does not exist, data for this exchange is empty, ignore
 		if nxt != nil {
 			exchanges = append(exchanges, exchange)
-			states[exchange] = rawDownloadIteratorAndLastLine{
+			states[exchange] = &rawDownloadIteratorAndLastLine{
 				Iterator: itr,
 				LastLine: nxt,
 			}
@@ -325,7 +324,7 @@ func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([
 			line := states[exchange].LastLine
 			if line.Timestamp < mi {
 				mi = line.Timestamp
-				argmin = i
+				argmin = j
 			}
 		}
 		state := states[exchanges[argmin]]
@@ -357,61 +356,54 @@ func (r RawRequest) Download() ([]StringLine, error) {
 	return r.DownloadWithContext(context.Background(), downloadBatchSize)
 }
 
-type rawStreamShardSlot struct {
-	// This channel will be closed to notify the goroutine who are responsible to set shard to
-	// this slot is stopped
-	downloaderStopped chan struct{}
-	shard             []StringLine
+type rawStreamShardResult struct {
+	shard []StringLine
+	// Index of buffer to put this result
+	index int
+	// This is non-nil if and only if shard is nil
+	err error
 }
 
+// rawExchageStreamShardIterator is the iterator that yields a shard
+// of a certain exchange one by one.
+// Always have to be closed after initialized.
+//
+// One and other multiple goroutine will be spawned by initializing,
+// the main goroutine will serve as a manager for all of individual
+// download routine and is called background, others are called download.
 type rawExchageStreamShardIterator struct {
 	// Must be initilized before init()
 	request *RawRequest
 	// Must be initilized before init()
 	exchange string
 	// Must be initilized before init()
-	buffer   [][]StringLine
-	position int
-	// If set, this channel will get closed by a background goroutine
-	// when the shard on current position is set on the buffer and became available
-	notifier chan struct{}
-	// Lock on the buffer and notifier
-	lock sync.Mutex
-	// Context background goroutine will run on
-	bgCtx context.Context
-	// Function to cancel background context
-	cancelBGCtx func()
+	bufferSize int
+	// Channel to get result from background goroutine
+	results chan []StringLine
 	// Channel to receive error from background goroutine
-	bgerr              chan error
-	nextDownloadMinute int64
-	startMinute        int64
-	endMinute          int64
+	bgErr chan error
+	// Cancels context background runs on
+	cancelBGCtx context.CancelFunc
 }
 
-// downloadSnapshot is a goroutine to download a snapshot shard parallelly
-func (i *rawExchageStreamShardIterator) downloadSnapshot(setPosition int) {
-	result, serr := httpSnapshot(i.bgCtx, i.request.cliSetting, snapshotSetting{
+func (i *rawExchageStreamShardIterator) downloadSnapshot(ctx context.Context, results chan *rawStreamShardResult) {
+	result, serr := httpSnapshot(ctx, i.request.cliSetting, snapshotSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		at:       i.request.start,
 		format:   i.request.format,
 	})
 	if serr != nil {
-		i.bgerr <- serr
+		results <- &rawStreamShardResult{err: serr}
 	}
-	// Lock when modify buffer
-	i.lock.Lock()
-	// Ensure unlocking
-	defer i.lock.Unlock()
-	i.buffer[setPosition%len(i.buffer)] = convertSnapshotsToLines(i.exchange, result)
-	if i.position == setPosition && i.notifier != nil {
-		close(i.notifier)
+	results <- &rawStreamShardResult{
+		index: 0,
+		shard: convertSnapshotsToLines(i.exchange, result),
 	}
 }
 
-// downloadSnapshot is a goroutine to download a filter shard parallelly
-func (i *rawExchageStreamShardIterator) downloadFilter(setPosition int, minute int64) {
-	result, serr := httpFilter(i.bgCtx, i.request.cliSetting, filterSetting{
+func (i *rawExchageStreamShardIterator) downloadFilter(ctx context.Context, minute int64, index int, results chan *rawStreamShardResult) {
+	result, serr := httpFilter(ctx, i.request.cliSetting, filterSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		minute:   minute,
@@ -420,16 +412,106 @@ func (i *rawExchageStreamShardIterator) downloadFilter(setPosition int, minute i
 		format:   i.request.format,
 	})
 	if serr != nil {
-		i.bgerr <- serr
+		results <- &rawStreamShardResult{err: serr}
 	}
-	// Lock when modify buffer
-	i.lock.Lock()
-	// Ensure unlocking
-	defer i.lock.Unlock()
-	i.buffer[setPosition%len(i.buffer)] = result
-	if i.notifier != nil {
-		close(i.notifier)
+	results <- &rawStreamShardResult{
+		index: index,
+		shard: result,
 	}
+}
+
+// background is the goroutine to manage all download goroutine associated with this iterator.
+// The goroutine will run on the context given, and stops its execution if the context was cancelled.
+// out should be put to a results field in `rawExchageStreamShardIterator` by the caller.
+func (i *rawExchageStreamShardIterator) background(ctx context.Context, out chan []StringLine, err chan error) {
+	defer close(out)
+	defer close(err)
+	startMinute := i.request.start / int64(time.Minute)
+	nextMinute := startMinute
+	// End is exclusive
+	endMinute := (i.request.end - 1) / int64(time.Minute)
+	results := make(chan *rawStreamShardResult)
+	defer close(results)
+	// Buffer to store results from download goroutines
+	buffer := make([][]StringLine, i.bufferSize)
+	// Current read position in the buffer
+	position := 0
+	// Number of running background goroutines
+	// This routine will not stop until this value is 0
+	running := 0
+	defer func() {
+		// Wait for all download routines to stop
+		// Download goroutines stop either by throwing an error or returning a result
+		for running > 0 {
+			// Ignoring errors and results
+			<-results
+			running--
+		}
+	}()
+	// Context for download routine
+	downloadCtx, cancelDLCtx := context.WithCancel(ctx)
+	defer cancelDLCtx()
+	// Run snapshot download
+	go i.downloadSnapshot(downloadCtx, results)
+	running++
+	// Run initial filter downloads
+	for j := 1; j < i.bufferSize && nextMinute <= endMinute; j++ {
+		// Execute download routine
+		go i.downloadFilter(downloadCtx, nextMinute, int(nextMinute-startMinute+1), results)
+		running++
+		nextMinute++
+	}
+	// Set this flag true to stop this loop
+	stop := false
+	for !stop {
+		if buffer[position] == nil {
+			select {
+			case res := <-results:
+				// Got a result or an error
+				running--
+				if res.err != nil {
+					// Received an error
+					stop = true
+					err <- fmt.Errorf("download: %v", res.err)
+					// Cancel download routine context to stop them
+					cancelDLCtx()
+				}
+				// Set shard in the buffer
+				buffer[res.index%i.bufferSize] = res.shard
+			case <-ctx.Done():
+				// Context is cancelled
+				stop = true
+				err <- fmt.Errorf("context: %v", ctx.Err())
+			}
+		} else {
+			select {
+			case res := <-results:
+				running--
+				if res.err != nil {
+					stop = true
+					err <- fmt.Errorf("download: %v", res.err)
+					cancelDLCtx()
+				}
+				buffer[res.index%i.bufferSize] = res.shard
+			case out <- buffer[position]:
+				buffer[position] = nil
+				if nextMinute <= endMinute {
+					go i.downloadFilter(downloadCtx, nextMinute, int(nextMinute-startMinute+1), results)
+					nextMinute++
+					running++
+				} else if int64(position-1)+startMinute == endMinute {
+					// Last shard was returned
+					// This background routine's job is done
+					stop = true
+				}
+				position++
+			case <-ctx.Done():
+				stop = true
+				err <- fmt.Errorf("context: %v", ctx.Err())
+			}
+		}
+	}
+	// Stop is gracelly handled by defer functions defined before
 }
 
 // init initialize this iterator by setting field value and start downloading
@@ -437,123 +519,249 @@ func (i *rawExchageStreamShardIterator) downloadFilter(setPosition int, minute i
 // Context given will be used by this iterator for its lifetime.
 // This includes `next()` and other operations.
 func (i *rawExchageStreamShardIterator) init(ctx context.Context) {
-	i.startMinute = i.request.start / int64(time.Minute)
-	i.nextDownloadMinute = i.startMinute
-	// End is exclusive
-	i.endMinute = (i.request.end - 1) / int64(time.Minute)
-	i.bgCtx, i.cancelBGCtx = context.WithCancel(ctx)
-	i.bgerr = make(chan error)
-	// Fill the buffer
-	go i.downloadSnapshot(0)
-	for j := 0; j < len(i.buffer)-1; j++ {
-		minute := i.startMinute + int64(j)
-		go i.downloadFilter(j+1, minute)
-		i.nextDownloadMinute++
-	}
+	// Make child context for background
+	var childCtx context.Context
+	childCtx, i.cancelBGCtx = context.WithCancel(ctx)
+	// Make channels for communication
+	i.results = make(chan []StringLine)
+	i.bgErr = make(chan error)
+	// Run background routine
+	go i.background(childCtx, i.results, i.bgErr)
 }
 
 // next returns the next shard on this iterator.
 //
-// Returns a shard immediately if it is buffered, if not, it waits for
+// Returns a shard immediately if it is buffered or reached the end, if not, it waits for
 // the shard to be available.
 //
 // Returns error if background download goroutines had encountered an error which has not been reported yet.
+// Returns nil if next shard is absent.
 //
 // This function runs on the context which was given when an iterator was initialized.
 func (i *rawExchageStreamShardIterator) next() ([]StringLine, error) {
-	minute := i.startMinute + int64(len(i.buffer))
-	if minute > i.endMinute {
-		// No bufferred shard in buffer
-		return nil, nil
-	}
-	// Acquire lock on buffer and notifier
-	i.lock.Lock()
-	if i.buffer[i.position%len(i.buffer)] == nil {
-		// Shard has not been downloaded yet
-		// Set notifier and wait for it
-		i.notifier = make(chan struct{})
-		// Don't forget to unlock
-		i.lock.Unlock()
-		select {
-		case <-i.notifier:
-			i.lock.Lock()
-			// Let go
-		case serr := <-i.bgerr:
-			// Error reported from background
+	// Check for background error
+	select {
+	case serr, ok := <-i.bgErr:
+		if ok {
 			return nil, serr
 		}
+		// Channel is closed
+	case result := <-i.results:
+		// result is nil if the channel is already closed
+		return result, nil
 	}
-	// At this point, lock is always active
-	defer i.lock.Unlock()
-	shard := i.buffer[i.position]
-	i.position++
-	if i.nextDownloadMinute <= i.endMinute {
-		// It have to buffer more shards
-		go i.downloadFilter(i.position+len(i.buffer), i.nextDownloadMinute)
-		i.nextDownloadMinute++
-	}
-	return shard, nil
+	// No next line to return
+	return nil, nil
 }
 
 // close stops goroutine used by this iterator
 // After non-nil return from the call, this iterator could be
 // safely ignored until gc will take care of them.
+// Returns error if there is an unreported error from background.
 func (i *rawExchageStreamShardIterator) close() error {
-	// Cancelling context will stop goroutine
+	// This will stop background
 	i.cancelBGCtx()
-	// Wait for all goroutine to stop
-
-	// Close channels
-	close(i.bgerr)
+	// Error channel will either be closed or return error
+	serr, ok := <-i.bgErr
+	if ok {
+		// Report error from background
+		return serr
+	}
+	return nil
 }
 
 type rawExchangeStreamIterator struct {
-	request  *RawRequest
-	shard    []StringLine
-	position int
+	// Must be initialized before `init()`
+	request *RawRequest
+	// Must be initialized before `init()`
+	exchange string
+	// Must be initialized before `init()`
+	bufferSize    int
+	shardIterator *rawExchageStreamShardIterator
+	shard         []StringLine
+	position      int
+}
+
+func (i *rawExchangeStreamIterator) init(ctx context.Context) error {
+	i.shardIterator = &rawExchageStreamShardIterator{
+		request:    i.request,
+		exchange:   i.exchange,
+		bufferSize: i.bufferSize,
+	}
+	i.shardIterator.init(ctx)
+	// Get the very first shard
+	var serr error
+	i.shard, serr = i.shardIterator.next()
+	if serr != nil {
+		return serr
+	}
+	return nil
+}
+
+func (i *rawExchangeStreamIterator) next() (*StringLine, error) {
+	// Skip shards does not have any more lines (or empty) as long as available
+	for i.shard != nil && len(i.shard) <= i.position {
+		var serr error
+		i.shard, serr = i.shardIterator.next()
+		i.position = 0
+		if serr != nil {
+			return nil, serr
+		}
+	}
+	if i.shard == nil {
+		// Reached the last line
+		return nil, nil
+	}
+	line := &i.shard[i.position]
+	i.position++
+	return line, nil
+}
+
+func (i *rawExchangeStreamIterator) close() error {
+	return i.shardIterator.close()
 }
 
 type rawStreamIteratorAndLastLine struct {
-	iterator rawExchangeStreamIterator
+	iterator *rawExchangeStreamIterator
 	lastLine *StringLine
 }
 
 type rawStreamIterator struct {
-	request   *RawRequest
-	state     rawStreamIteratorAndLastLine
+	// Must be initialized before `init()`
+	request *RawRequest
+	// Must be initialized before `init()`
+	bufferSize int
+	// Map of exchange vs struct
+	states    map[string]*rawStreamIteratorAndLastLine
 	exchanges []string
 }
 
-func (i rawStreamIterator) next() StringLine {
-	if len(i.exchanges) == 0 {
-
+func (i *rawStreamIterator) init(ctx context.Context) error {
+	i.states = make(map[string]*rawStreamIteratorAndLastLine)
+	i.exchanges = make([]string, 0, len(i.request.filter))
+	for exchange := range i.request.filter {
+		iterator := &rawExchangeStreamIterator{
+			request:    i.request,
+			exchange:   exchange,
+			bufferSize: i.bufferSize,
+		}
+		serr := iterator.init(ctx)
+		if serr != nil {
+			return serr
+		}
+		next, serr := iterator.next()
+		if serr != nil {
+			return serr
+		}
+		// Skip if an exchange iterator returns no line
+		if next == nil {
+			continue
+		}
+		i.states[exchange] = &rawStreamIteratorAndLastLine{
+			iterator: iterator,
+			lastLine: next,
+		}
+		i.exchanges = append(i.exchanges, exchange)
 	}
+	return nil
 }
 
-func newRawStreamIterator(cliSetting clientSetting) {
-	itr := new(rawStreamIterator)
-	itr.cliSetting = cliSetting
+func (i *rawStreamIterator) Next() (*StringLine, error) {
+	if len(i.exchanges) == 0 {
+		// All lines returned
+		return nil, nil
+	}
+	// Return the line that has the smallest timestamp across exchanges
+	argmin := 0
+	min := i.states[i.exchanges[argmin]].lastLine.Timestamp
+	for j := 1; j < len(i.exchanges); j++ {
+		lastLine := i.states[i.exchanges[j]].lastLine
+		if lastLine.Timestamp < min {
+			argmin = j
+			min = lastLine.Timestamp
+		}
+	}
+	// Get the next line for this exchange
+	state := i.states[i.exchanges[argmin]]
+	line := state.lastLine
+	next, serr := state.iterator.next()
+	if serr != nil {
+		return nil, serr
+	}
+	if next == nil {
+		// There is no next line, remove this exchange from the list
+		i.exchanges = append(i.exchanges[:argmin], i.exchanges[argmin+1:]...)
+		serr := state.iterator.close()
+		if serr != nil {
+			return nil, serr
+		}
+	}
+	state.lastLine = next
+	return line, nil
 }
 
-// Stream sends request to server and returns iterator to read response.
+func (i *rawStreamIterator) Close() error {
+	var serr error
+	for _, exchange := range i.exchanges {
+		// This will ignore errors other then the first one
+		if serr == nil {
+			// This could return error
+			serr = i.states[exchange].iterator.close()
+		} else {
+			// Ignore other errors
+			i.states[exchange].iterator.close()
+		}
+	}
+	if serr != nil {
+		return serr
+	}
+	return nil
+}
+
+// StringLineIterator is the interface of iterator which yields `*StringLine`.
+type StringLineIterator interface {
+	// Next returns the next line from the iterator.
+	// error is non-nil if and only if line is nil.
+	Next() (*StringLine, error)
+	// Close frees resources this iterator is using.
+	// **Must** always be called after the use of this iterator.
+	Close() error
+}
+
+// Stream sends requests to the server and returns iterator for reading the response.
 //
-// Returns object yields response line by line.
-// Iterator yields immidiately if a line is bufferred, waits for download if not avaliable.
+// Returns an iterator yields line by line if and only if error is not returned.
+// An iterator yields immidiately if a line is bufferred, waits for download if not avaliable.
 //
-// **Please note that buffering won't start by calling this method, calling {@link AsyncIterator.next()} will.**
+// Lines will be bufferred immidiately after calling this function.
 //
 // Higher responsiveness than `download` is expected as it does not have to wait for
 // the entire data to be downloaded.
-//
-// bufferSize is optional. Desired buffer size to store streaming data. One shard is equavalent to one minute.
-// func (r *RawRequest) Stream(bufferSize int) []StringLine {
-// 	return r.StreamWithContext(context.Background())
-// }
+func (r *RawRequest) Stream() (StringLineIterator, error) {
+	return r.StreamWithContext(context.Background(), defaultBufferSize)
+}
 
-// // StreamWithContext sends request to server with the given context and returns iterator to read response.
-// func (r *RawRequest) StreamWithContext(ctx context.Context) []StringLine {
+// StreamBufferSize is same as Stream but with custom bufferSize.
+// `bufferSize` is the desired buffer size to store streaming data.
+// One shard is equavalent to one minute.
+func (r *RawRequest) StreamBufferSize(bufferSize int) (StringLineIterator, error) {
+	return r.StreamWithContext(context.Background(), bufferSize)
+}
 
-// }
+// StreamWithContext is same as `Stream` but a context can be given.
+// Background downloads and the returned iterator will use the context for their lifetime.
+// Cancelling the context will stop running background downloads, and future `next` calls to the iterator might produce error.
+func (r *RawRequest) StreamWithContext(ctx context.Context, bufferSize int) (StringLineIterator, error) {
+	itr := &rawStreamIterator{
+		request:    r,
+		bufferSize: bufferSize,
+	}
+	serr := itr.init(ctx)
+	if serr != nil {
+		return nil, serr
+	}
+	return itr, nil
+}
 
 // Raw creates new `RawRequest` with the given parameters and returns its pointer.
 // `*RawRequest` is nil if error was returned.

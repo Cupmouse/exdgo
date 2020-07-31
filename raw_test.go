@@ -1,12 +1,13 @@
 package exdgo
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
 )
 
-func TestDownload(t *testing.T) {
+func prepareRawRequest(t *testing.T) *RawRequest {
 	cli := ClientParam{
 		APIKey: "demo",
 	}
@@ -30,6 +31,11 @@ func TestDownload(t *testing.T) {
 	if serr != nil {
 		t.Fatal(serr)
 	}
+	return req
+}
+
+func TestDownloadAllShards(t *testing.T) {
+	req := prepareRawRequest(t)
 	shards, serr := req.downloadAllShards(context.Background(), downloadBatchSize)
 	if serr != nil {
 		t.Fatal(serr)
@@ -39,11 +45,50 @@ func TestDownload(t *testing.T) {
 			t.Fatal("shard len 0")
 		}
 	}
+}
+
+func TestRawDownloadAndStream(t *testing.T) {
+	req := prepareRawRequest(t)
+
 	lines, serr := req.Download()
 	if serr != nil {
 		t.Fatal(serr)
 	}
 	if len(lines) == 0 {
 		t.Fatal("lines len 0")
+	}
+	itr, serr := req.Stream()
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	defer itr.Close()
+	i := 0
+	for {
+		line, serr := itr.Next()
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		if line == nil {
+			break
+		}
+		if *line.Channel != *lines[i].Channel {
+			t.Fatal("channel differ")
+		}
+		if line.Exchange != lines[i].Exchange {
+			t.Fatal("exchange differ")
+		}
+		if bytes.Compare(line.Message, lines[i].Message) != 0 {
+			t.Fatal("message differ")
+		}
+		if line.Timestamp != lines[i].Timestamp {
+			t.Fatal("timestamp differ")
+		}
+		if line.Type != lines[i].Type {
+			t.Fatal("type differ")
+		}
+		i++
+	}
+	if len(lines) != i {
+		t.Fatal("len(lines) != i")
 	}
 }
