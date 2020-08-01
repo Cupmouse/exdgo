@@ -23,43 +23,27 @@ type RawRequestParam struct {
 
 // RawRequest replays market data in raw format.
 //
-// You can pick the way to read the response:
+// There is two ways of reading the response:
 // - `download` to immidiately start downloading the whole response as one array.
 // - `stream` to return iterable object yields line by line.
 type RawRequest struct {
-	cliSetting clientSetting
-	filter     map[string][]string
-	start      int64
-	end        int64
-	format     *string
+	cli    *Client
+	filter map[string][]string
+	start  int64
+	end    int64
+	format *string
 }
 
 // setupRawRequest validates parameter and creates new `RawRequest`.
 // req is nil if err is reported.
-func setupRawRequest(cliSetting clientSetting, param RawRequestParam) (*RawRequest, error) {
+func setupRawRequest(cli *Client, param RawRequestParam) (*RawRequest, error) {
 	req := new(RawRequest)
-	req.cliSetting = cliSetting
-	// Copy filter map and validate content at the same time
-	filterCopied := make(map[string][]string)
-	for exc, chs := range param.Filter {
-		// Validate exchange name
-		if !regexName.MatchString(exc) {
-			return nil, errors.New("invalid characters in exchange in 'Filter'")
-		}
-		// Validate channel names
-		for _, ch := range chs {
-			if !regexName.MatchString(ch) {
-				return nil, errors.New("invalid characters in channel in 'Filter'")
-			}
-		}
-		// Perform slice copy
-		chsCopied := make([]string, len(chs))
-		if copied := copy(chsCopied, chs); copied != len(chs) {
-			return nil, errors.New("copy of slice failed")
-		}
-		filterCopied[exc] = chsCopied
+	req.cli = cli
+	var serr error
+	req.filter, serr = copyFilter(param.Filter)
+	if serr != nil {
+		return nil, serr
 	}
-	req.filter = filterCopied
 	start := param.Start.UnixNano()
 	end := param.End.UnixNano()
 	if start >= end {
@@ -116,13 +100,13 @@ type rawDownloadJobResult struct {
 // Works on job provided by `jobs` channel.
 // `err` is used for multiple workers, so it won't be closed from worker.
 // Instead, worker will close `stopped` channel to let others know that this worker had stopped.
-func rawDownloadWorker(ctx context.Context, cliSetting clientSetting, jobs chan *rawDownloadJob, results chan *rawDownloadJobResult, err chan error, stopped chan struct{}) {
+func rawDownloadWorker(ctx context.Context, cli *Client, jobs chan *rawDownloadJob, results chan *rawDownloadJobResult, err chan error, stopped chan struct{}) {
 	defer close(stopped)
 	// Do job if it can and jobs are available
 	for job := range jobs {
 		if job.typ == rawDownloadJobSnapshot {
 			setting := job.setting.(snapshotSetting)
-			ret, serr := httpSnapshot(ctx, cliSetting, setting)
+			ret, serr := httpSnapshot(ctx, cli, setting)
 			if serr != nil {
 				err <- serr
 			}
@@ -133,7 +117,7 @@ func rawDownloadWorker(ctx context.Context, cliSetting clientSetting, jobs chan 
 			}
 		} else if job.typ == rawDonwloadJobFilter {
 			setting := job.setting.(filterSetting)
-			ret, serr := httpFilter(ctx, cliSetting, setting)
+			ret, serr := httpFilter(ctx, cli, setting)
 			if serr != nil {
 				err <- serr
 			}
@@ -149,7 +133,7 @@ func rawDownloadWorker(ctx context.Context, cliSetting clientSetting, jobs chan 
 	}
 }
 
-func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map[string][][]StringLine, error) {
+func (r *RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map[string][][]StringLine, error) {
 	// Calculate the size of the request
 	startMinute := r.start / int64(time.Minute)
 	// Exclude the exact nanosec of end
@@ -191,7 +175,7 @@ func (r RawRequest) downloadAllShards(ctx context.Context, concurrency int) (map
 	// Run all worker
 	for i := 0; i < concurrency; i++ {
 		workerPool[i] = make(chan struct{})
-		go rawDownloadWorker(childCtx, r.cliSetting, jobsCh, resultsCh, errCh, workerPool[i])
+		go rawDownloadWorker(childCtx, r.cli, jobsCh, resultsCh, errCh, workerPool[i])
 	}
 
 	// Send jobs to worker
@@ -282,11 +266,9 @@ type rawDownloadIteratorAndLastLine struct {
 	LastLine *StringLine
 }
 
-// DownloadWithContext sends request and download response in an array with the given context.
-// Data are downloaded parallelly by `concurrecy` goroutine.
-// Returns slice if and only if error was not reported.
-// Otherwise, slice is non-nil.
-func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([]StringLine, error) {
+// DownloadWithContext is same as `Download()`, but sends requests in given concurrency
+// in given context.
+func (r *RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([]StringLine, error) {
 	mapped, serr := r.downloadAllShards(ctx, concurrency)
 	if serr != nil {
 		return nil, serr
@@ -342,17 +324,15 @@ func (r RawRequest) DownloadWithContext(ctx context.Context, concurrency int) ([
 	return result, nil
 }
 
-// DownloadConcurrency sends request in desired concurrency and download response in an slice.
-// Returns slice if and only if error was not reported.
-// Otherwise, slice is non-nil.
-func (r RawRequest) DownloadConcurrency(concurrency int) ([]StringLine, error) {
+// DownloadConcurrency is same as `Download()`, but sends requests in given concurrency.
+func (r *RawRequest) DownloadConcurrency(concurrency int) ([]StringLine, error) {
 	return r.DownloadWithContext(context.Background(), concurrency)
 }
 
 // Download sends request and download response in an slice.
 // Returns slice if and only if error was not reported.
 // Otherwise, slice is non-nil.
-func (r RawRequest) Download() ([]StringLine, error) {
+func (r *RawRequest) Download() ([]StringLine, error) {
 	return r.DownloadWithContext(context.Background(), downloadBatchSize)
 }
 
@@ -364,19 +344,16 @@ type rawStreamShardResult struct {
 	err error
 }
 
-// rawExchageStreamShardIterator is the iterator that yields a shard
+// rawExchangeStreamShardIterator is the iterator that yields a shard
 // of a certain exchange one by one.
 // Always have to be closed after initialized.
 //
 // One and other multiple goroutine will be spawned by initializing,
 // the main goroutine will serve as a manager for all of individual
 // download routine and is called background, others are called download.
-type rawExchageStreamShardIterator struct {
-	// Must be initilized before init()
-	request *RawRequest
-	// Must be initilized before init()
-	exchange string
-	// Must be initilized before init()
+type rawExchangeStreamShardIterator struct {
+	request    *RawRequest
+	exchange   string
 	bufferSize int
 	// Channel to get result from background goroutine
 	results chan []StringLine
@@ -386,8 +363,8 @@ type rawExchageStreamShardIterator struct {
 	cancelBGCtx context.CancelFunc
 }
 
-func (i *rawExchageStreamShardIterator) downloadSnapshot(ctx context.Context, results chan *rawStreamShardResult) {
-	result, serr := httpSnapshot(ctx, i.request.cliSetting, snapshotSetting{
+func (i *rawExchangeStreamShardIterator) downloadSnapshot(ctx context.Context, results chan *rawStreamShardResult) {
+	result, serr := httpSnapshot(ctx, i.request.cli, snapshotSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		at:       i.request.start,
@@ -402,8 +379,8 @@ func (i *rawExchageStreamShardIterator) downloadSnapshot(ctx context.Context, re
 	}
 }
 
-func (i *rawExchageStreamShardIterator) downloadFilter(ctx context.Context, minute int64, index int, results chan *rawStreamShardResult) {
-	result, serr := httpFilter(ctx, i.request.cliSetting, filterSetting{
+func (i *rawExchangeStreamShardIterator) downloadFilter(ctx context.Context, minute int64, index int, results chan *rawStreamShardResult) {
+	result, serr := httpFilter(ctx, i.request.cli, filterSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		minute:   minute,
@@ -423,7 +400,7 @@ func (i *rawExchageStreamShardIterator) downloadFilter(ctx context.Context, minu
 // background is the goroutine to manage all download goroutine associated with this iterator.
 // The goroutine will run on the context given, and stops its execution if the context was cancelled.
 // out should be put to a results field in `rawExchageStreamShardIterator` by the caller.
-func (i *rawExchageStreamShardIterator) background(ctx context.Context, out chan []StringLine, err chan error) {
+func (i *rawExchangeStreamShardIterator) background(ctx context.Context, out chan []StringLine, err chan error) {
 	defer close(out)
 	defer close(err)
 	startMinute := i.request.start / int64(time.Minute)
@@ -518,7 +495,11 @@ func (i *rawExchageStreamShardIterator) background(ctx context.Context, out chan
 // to fill buffer.
 // Context given will be used by this iterator for its lifetime.
 // This includes `next()` and other operations.
-func (i *rawExchageStreamShardIterator) init(ctx context.Context) {
+func newRawExchangeStreamShardIterator(ctx context.Context, request *RawRequest, exchange string, bufferSize int) *rawExchangeStreamShardIterator {
+	i := new(rawExchangeStreamShardIterator)
+	i.request = request
+	i.exchange = exchange
+	i.bufferSize = bufferSize
 	// Make child context for background
 	var childCtx context.Context
 	childCtx, i.cancelBGCtx = context.WithCancel(ctx)
@@ -527,6 +508,7 @@ func (i *rawExchageStreamShardIterator) init(ctx context.Context) {
 	i.bgErr = make(chan error)
 	// Run background routine
 	go i.background(childCtx, i.results, i.bgErr)
+	return i
 }
 
 // next returns the next shard on this iterator.
@@ -538,7 +520,7 @@ func (i *rawExchageStreamShardIterator) init(ctx context.Context) {
 // Returns nil if next shard is absent.
 //
 // This function runs on the context which was given when an iterator was initialized.
-func (i *rawExchageStreamShardIterator) next() ([]StringLine, error) {
+func (i *rawExchangeStreamShardIterator) next() ([]StringLine, error) {
 	// Check for background error
 	select {
 	case serr, ok := <-i.bgErr:
@@ -558,7 +540,7 @@ func (i *rawExchageStreamShardIterator) next() ([]StringLine, error) {
 // After non-nil return from the call, this iterator could be
 // safely ignored until gc will take care of them.
 // Returns error if there is an unreported error from background.
-func (i *rawExchageStreamShardIterator) close() error {
+func (i *rawExchangeStreamShardIterator) close() error {
 	// This will stop background
 	i.cancelBGCtx()
 	// Error channel will either be closed or return error
@@ -571,31 +553,21 @@ func (i *rawExchageStreamShardIterator) close() error {
 }
 
 type rawExchangeStreamIterator struct {
-	// Must be initialized before `init()`
-	request *RawRequest
-	// Must be initialized before `init()`
-	exchange string
-	// Must be initialized before `init()`
-	bufferSize    int
-	shardIterator *rawExchageStreamShardIterator
+	shardIterator *rawExchangeStreamShardIterator
 	shard         []StringLine
 	position      int
 }
 
-func (i *rawExchangeStreamIterator) init(ctx context.Context) error {
-	i.shardIterator = &rawExchageStreamShardIterator{
-		request:    i.request,
-		exchange:   i.exchange,
-		bufferSize: i.bufferSize,
-	}
-	i.shardIterator.init(ctx)
+func newRawExchangeStreamIterator(ctx context.Context, request *RawRequest, exchange string, bufferSize int) (*rawExchangeStreamIterator, error) {
+	i := new(rawExchangeStreamIterator)
+	i.shardIterator = newRawExchangeStreamShardIterator(ctx, request, exchange, bufferSize)
 	// Get the very first shard
 	var serr error
 	i.shard, serr = i.shardIterator.next()
 	if serr != nil {
-		return serr
+		return nil, serr
 	}
-	return nil
+	return i, nil
 }
 
 func (i *rawExchangeStreamIterator) next() (*StringLine, error) {
@@ -627,31 +599,23 @@ type rawStreamIteratorAndLastLine struct {
 }
 
 type rawStreamIterator struct {
-	// Must be initialized before `init()`
-	request *RawRequest
-	// Must be initialized before `init()`
-	bufferSize int
 	// Map of exchange vs struct
 	states    map[string]*rawStreamIteratorAndLastLine
 	exchanges []string
 }
 
-func (i *rawStreamIterator) init(ctx context.Context) error {
+func newRawStreamIterator(ctx context.Context, request *RawRequest, bufferSize int) (*rawStreamIterator, error) {
+	i := new(rawStreamIterator)
 	i.states = make(map[string]*rawStreamIteratorAndLastLine)
-	i.exchanges = make([]string, 0, len(i.request.filter))
-	for exchange := range i.request.filter {
-		iterator := &rawExchangeStreamIterator{
-			request:    i.request,
-			exchange:   exchange,
-			bufferSize: i.bufferSize,
-		}
-		serr := iterator.init(ctx)
+	i.exchanges = make([]string, 0, len(request.filter))
+	for exchange := range request.filter {
+		iterator, serr := newRawExchangeStreamIterator(ctx, request, exchange, bufferSize)
 		if serr != nil {
-			return serr
+			return nil, serr
 		}
 		next, serr := iterator.next()
 		if serr != nil {
-			return serr
+			return nil, serr
 		}
 		// Skip if an exchange iterator returns no line
 		if next == nil {
@@ -663,13 +627,13 @@ func (i *rawStreamIterator) init(ctx context.Context) error {
 		}
 		i.exchanges = append(i.exchanges, exchange)
 	}
-	return nil
+	return i, nil
 }
 
-func (i *rawStreamIterator) Next() (*StringLine, error) {
+func (i *rawStreamIterator) Next() (next *StringLine, ok bool, err error) {
 	if len(i.exchanges) == 0 {
 		// All lines returned
-		return nil, nil
+		return nil, false, nil
 	}
 	// Return the line that has the smallest timestamp across exchanges
 	argmin := 0
@@ -686,18 +650,18 @@ func (i *rawStreamIterator) Next() (*StringLine, error) {
 	line := state.lastLine
 	next, serr := state.iterator.next()
 	if serr != nil {
-		return nil, serr
+		return nil, false, serr
 	}
 	if next == nil {
 		// There is no next line, remove this exchange from the list
 		i.exchanges = append(i.exchanges[:argmin], i.exchanges[argmin+1:]...)
 		serr := state.iterator.close()
 		if serr != nil {
-			return nil, serr
+			return nil, false, serr
 		}
 	}
 	state.lastLine = next
-	return line, nil
+	return line, true, nil
 }
 
 func (i *rawStreamIterator) Close() error {
@@ -721,17 +685,19 @@ func (i *rawStreamIterator) Close() error {
 // StringLineIterator is the interface of iterator which yields `*StringLine`.
 type StringLineIterator interface {
 	// Next returns the next line from the iterator.
-	// error is non-nil if and only if line is nil.
-	Next() (*StringLine, error)
+	// If the next line exists, `ok` is true ad `line` is non-nil, otherwise false and `line` is nil.
+	// `ok` is false if an error was returned.
+	Next() (line *StringLine, ok bool, err error)
+
 	// Close frees resources this iterator is using.
 	// **Must** always be called after the use of this iterator.
 	Close() error
 }
 
-// Stream sends requests to the server and returns iterator for reading the response.
+// Stream sends requests to the server and returns an iterator for reading the response.
 //
-// Returns an iterator yields line by line if and only if error is not returned.
-// An iterator yields immidiately if a line is bufferred, waits for download if not avaliable.
+// Returns an iterator yields line by line if and only if an error is not returned.
+// The iterator yields immidiately if a line is bufferred, waits for download if not avaliable.
 //
 // Lines will be bufferred immidiately after calling this function.
 //
@@ -752,11 +718,7 @@ func (r *RawRequest) StreamBufferSize(bufferSize int) (StringLineIterator, error
 // Background downloads and the returned iterator will use the context for their lifetime.
 // Cancelling the context will stop running background downloads, and future `next` calls to the iterator might produce error.
 func (r *RawRequest) StreamWithContext(ctx context.Context, bufferSize int) (StringLineIterator, error) {
-	itr := &rawStreamIterator{
-		request:    r,
-		bufferSize: bufferSize,
-	}
-	serr := itr.init(ctx)
+	itr, serr := newRawStreamIterator(ctx, r, bufferSize)
 	if serr != nil {
 		return nil, serr
 	}
@@ -764,18 +726,18 @@ func (r *RawRequest) StreamWithContext(ctx context.Context, bufferSize int) (Str
 }
 
 // Raw creates new `RawRequest` with the given parameters and returns its pointer.
-// `*RawRequest` is nil if error was returned.
+// `*RawRequest` is nil if an error was returned.
 func Raw(clientParam ClientParam, param RawRequestParam) (*RawRequest, error) {
-	cliSetting, serr := setupClientSetting(clientParam)
+	cliSetting, serr := setupClient(clientParam)
 	if serr != nil {
 		return nil, serr
 	}
-	return setupRawRequest(cliSetting, param)
+	return setupRawRequest(&cliSetting, param)
 }
 
 // Raw is a lower-level API that processes data from Exchangedataset HTTP-API and generate raw (close to exchanges' format) data.
-// Returns pointer to new `RawRequest` if and only if error was not returned.
+// Returns a pointer to new `RawRequest` if and only if an error was not returned.
 // Otherwise, it's nil.
 func (c *Client) Raw(param RawRequestParam) (*RawRequest, error) {
-	return setupRawRequest(c.setting, param)
+	return setupRawRequest(c, param)
 }

@@ -1,13 +1,11 @@
 package exdgo
 
 import (
-	"bytes"
-	"context"
 	"testing"
 	"time"
 )
 
-func prepareRawRequest(t *testing.T) *RawRequest {
+func prepareReplayRequest(t *testing.T) *ReplayRequest {
 	cli := ClientParam{
 		APIKey: "demo",
 	}
@@ -19,36 +17,23 @@ func prepareRawRequest(t *testing.T) *RawRequest {
 	if serr != nil {
 		t.Fatalf("testing error: %v", serr)
 	}
-	set := RawRequestParam{
+	reqp := ReplayRequestParam{
 		Filter: map[string][]string{
-			"bitmex":   []string{"orderBookL2"},
+			"bitmex":   []string{"orderBookL2_XBTUSD"},
 			"bitfinex": []string{"trades_tBTCUSD"},
 		},
 		Start: start,
 		End:   end,
 	}
-	req, serr := Raw(cli, set)
+	req, serr := Replay(cli, reqp)
 	if serr != nil {
 		t.Fatal(serr)
 	}
 	return req
 }
 
-func TestDownloadAllShards(t *testing.T) {
-	req := prepareRawRequest(t)
-	shards, serr := req.downloadAllShards(context.Background(), downloadBatchSize)
-	if serr != nil {
-		t.Fatal(serr)
-	}
-	for _, shard := range shards {
-		if len(shard) == 0 {
-			t.Fatal("shard len 0")
-		}
-	}
-}
-
-func TestRawDownloadAndStream(t *testing.T) {
-	req := prepareRawRequest(t)
+func TestReplayDownloadAndStream(t *testing.T) {
+	req := prepareReplayRequest(t)
 
 	lines, serr := req.Download()
 	if serr != nil {
@@ -77,9 +62,9 @@ func TestRawDownloadAndStream(t *testing.T) {
 		if line.Exchange != lines[i].Exchange {
 			t.Fatal("exchange differ")
 		}
-		if bytes.Compare(line.Message, lines[i].Message) != 0 {
-			t.Fatal("message differ")
-		}
+		// if bytes.Compare(line.Message, lines[i].Message) != 0 {
+		// 	t.Fatal("message differ")
+		// }
 		if line.Timestamp != lines[i].Timestamp {
 			t.Fatal("timestamp differ")
 		}

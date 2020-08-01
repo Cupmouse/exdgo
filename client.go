@@ -13,13 +13,14 @@ type ClientParam struct {
 	Timeout *time.Duration
 }
 
-type clientSetting struct {
+// Client for accessing to Exchangedataset API.
+type Client struct {
 	apikey  string
 	timeout time.Duration
 }
 
-// setupClientSetting finalize ClientParam to get clientSetting
-func setupClientSetting(param ClientParam) (setting clientSetting, err error) {
+// setupClient finalize ClientParam and returns `Client`
+func setupClient(param ClientParam) (cli Client, err error) {
 	if param.APIKey == "" {
 		err = errors.New("empty parameter 'APIKey'")
 		return
@@ -28,37 +29,26 @@ func setupClientSetting(param ClientParam) (setting clientSetting, err error) {
 		err = errors.New("parameter 'APIKey' not a valid API-key")
 		return
 	}
-	setting.apikey = param.APIKey
+	cli.apikey = param.APIKey
 	if param.Timeout == nil {
 		// Set the default value
-		setting.timeout = clientDefaultTimeout
+		cli.timeout = clientDefaultTimeout
 	} else {
 		if *param.Timeout < 0 {
 			err = errors.New("parameter 'Timeout' negative")
 			return
 		}
-		setting.timeout = *param.Timeout
+		cli.timeout = *param.Timeout
 	}
 	return
 }
 
-// Client for accessing to Exchangedataset API.
-type Client struct {
-	setting clientSetting
-}
-
-// func (c *Client) Replay(params ReplayRequestParam) {
-
-// }
-
 // CreateClient creates new Client and returns pointer to it.
 func CreateClient(param ClientParam) (*Client, error) {
-	var serr error
-	// Create new Client and set API-key
-	client := new(Client)
-	client.setting, serr = setupClientSetting(param)
+	// Create new Client
+	client, serr := setupClient(param)
 	if serr != nil {
 		return nil, serr
 	}
-	return client, nil
+	return &client, nil
 }

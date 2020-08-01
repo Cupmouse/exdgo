@@ -1,6 +1,7 @@
 package exdgo
 
 import (
+	"errors"
 	"regexp"
 	"time"
 )
@@ -55,7 +56,7 @@ const (
 type StructLine struct {
 	Exchange  string
 	Type      LineType
-	Timestamp int
+	Timestamp int64
 	Channel   *string
 	Message   interface{}
 }
@@ -100,4 +101,28 @@ type StringLine struct {
 	// Message.
 	// Could be `nil` accoring to `type`.
 	Message []byte
+}
+
+func copyFilter(filter map[string][]string) (map[string][]string, error) {
+	// Copy filter map and validate content at the same time
+	filterCopied := make(map[string][]string)
+	for exc, chs := range filter {
+		// Validate exchange name
+		if !regexName.MatchString(exc) {
+			return nil, errors.New("invalid characters in exchange in 'Filter'")
+		}
+		// Validate channel names
+		for _, ch := range chs {
+			if !regexName.MatchString(ch) {
+				return nil, errors.New("invalid characters in channel in 'Filter'")
+			}
+		}
+		// Perform slice copy
+		chsCopied := make([]string, len(chs))
+		if copied := copy(chsCopied, chs); copied != len(chs) {
+			return nil, errors.New("copy of slice failed")
+		}
+		filterCopied[exc] = chsCopied
+	}
+	return filterCopied, nil
 }

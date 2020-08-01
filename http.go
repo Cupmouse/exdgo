@@ -18,8 +18,8 @@ import (
 // httpDownload will send HTTP GET request to HTTP Endpoint with timeout.
 // clientSetting's Timeout duration is used.
 // Response is nil if and only if error is non-nil.
-func httpDownloadWithTimeout(ctx context.Context, setting clientSetting, path string, params url.Values) (statusCode int, body []byte, err error) {
-	childCtx, cancel := context.WithTimeout(ctx, setting.timeout)
+func httpDownloadWithTimeout(ctx context.Context, cli *Client, path string, params url.Values) (statusCode int, body []byte, err error) {
+	childCtx, cancel := context.WithTimeout(ctx, cli.timeout)
 	// Free resources anyway
 	defer cancel()
 
@@ -31,7 +31,7 @@ func httpDownloadWithTimeout(ctx context.Context, setting clientSetting, path st
 	// Set query parameter
 	req.URL.RawQuery = params.Encode()
 	// Set authorization header
-	req.Header.Add("Authorization", "Bearer "+setting.apikey)
+	req.Header.Add("Authorization", "Bearer "+cli.apikey)
 	res, serr := http.DefaultClient.Do(req)
 	if serr != nil {
 		err = fmt.Errorf("request %s: %v", path, serr)
@@ -151,7 +151,7 @@ func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err err
 
 // httpSnapshot is internal function for requesting Snapshot HTTP Endpoint
 // using settings for both client and snapshot.
-func httpSnapshot(ctx context.Context, clientSetting clientSetting, setting snapshotSetting) ([]Snapshot, error) {
+func httpSnapshot(ctx context.Context, cli *Client, setting snapshotSetting) ([]Snapshot, error) {
 	path := fmt.Sprintf("snapshot/%s/%d", setting.exchange, setting.at)
 	params := make(url.Values)
 	params["channels"] = setting.channels
@@ -161,7 +161,7 @@ func httpSnapshot(ctx context.Context, clientSetting clientSetting, setting snap
 	}
 
 	// Send a request to server
-	statusCode, body, serr := httpDownloadWithTimeout(ctx, clientSetting, path, params)
+	statusCode, body, serr := httpDownloadWithTimeout(ctx, cli, path, params)
 	if serr != nil {
 		return nil, serr
 	}
@@ -219,7 +219,7 @@ func HTTPSnapshot(clientParam ClientParam, param SnapshotParam) ([]Snapshot, err
 // HTTPSnapshotWithContext create and return request to Snapshot HTTP-API endpoint with given context.
 // Returns nil as `Snapshot` slice when error had occurred and non-nil error was returned.
 func HTTPSnapshotWithContext(ctx context.Context, clientParam ClientParam, param SnapshotParam) ([]Snapshot, error) {
-	cs, serr := setupClientSetting(clientParam)
+	cli, serr := setupClient(clientParam)
 	if serr != nil {
 		return nil, fmt.Errorf("invalid field in client parameter: %v", serr)
 	}
@@ -227,7 +227,7 @@ func HTTPSnapshotWithContext(ctx context.Context, clientParam ClientParam, param
 	if serr != nil {
 		return nil, fmt.Errorf("invalid field in snapshot parameter: %v", serr)
 	}
-	return httpSnapshot(ctx, cs, ss)
+	return httpSnapshot(ctx, &cli, ss)
 }
 
 // HTTPSnapshot create and return request to Snapshot HTTP-API endpoint.
@@ -244,7 +244,7 @@ func (c *Client) HTTPSnapshotWithContext(ctx context.Context, param SnapshotPara
 		// User can distinguish parameter error from other error.
 		return
 	}
-	return httpSnapshot(ctx, c.setting, ss)
+	return httpSnapshot(ctx, c, ss)
 }
 
 // FilterParam is the parameters to make new request to Filter HTTP Endpoint.
@@ -318,7 +318,7 @@ func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
 // httpFilter is internal function for requesting filter HTTP Endpoint
 // using settings for both client and filter.
 // Returns nil as a slice of `StringLine` if and only if error was not nil.
-func httpFilter(ctx context.Context, clientSetting clientSetting, setting filterSetting) ([]StringLine, error) {
+func httpFilter(ctx context.Context, cli *Client, setting filterSetting) ([]StringLine, error) {
 	path := fmt.Sprintf("filter/%s/%d", setting.exchange, setting.minute)
 	params := make(url.Values)
 	// Don't have to copy, this slice is supposed read-only
@@ -334,7 +334,7 @@ func httpFilter(ctx context.Context, clientSetting clientSetting, setting filter
 		params["format"] = []string{*setting.format}
 	}
 	// Send a request to server
-	statusCode, body, serr := httpDownloadWithTimeout(ctx, clientSetting, path, params)
+	statusCode, body, serr := httpDownloadWithTimeout(ctx, cli, path, params)
 	if serr != nil {
 		return nil, serr
 	}
@@ -438,7 +438,7 @@ func HTTPFilter(clientParam ClientParam, param FilterParam) ([]StringLine, error
 // HTTPFilterWithContext create and return request to Filter HTTP-API endpoint with the given context.
 // Returns nil as `StringLine` slice when error had occurred and non-nil error was returned.
 func HTTPFilterWithContext(ctx context.Context, clientParam ClientParam, param FilterParam) ([]StringLine, error) {
-	cs, serr := setupClientSetting(clientParam)
+	cli, serr := setupClient(clientParam)
 	if serr != nil {
 		return nil, fmt.Errorf("invalid client parameter: %v", serr)
 	}
@@ -446,7 +446,7 @@ func HTTPFilterWithContext(ctx context.Context, clientParam ClientParam, param F
 	if serr != nil {
 		return nil, fmt.Errorf("invalid filter parameter: %v", serr)
 	}
-	return httpFilter(ctx, cs, fs)
+	return httpFilter(ctx, &cli, fs)
 }
 
 // HTTPFilter create and return request to Filter HTTP-API endpoint.
@@ -462,5 +462,5 @@ func (c *Client) HTTPFilterWithContext(ctx context.Context, param FilterParam) (
 	if err != nil {
 		return
 	}
-	return httpFilter(ctx, c.setting, fs)
+	return httpFilter(ctx, c, fs)
 }
