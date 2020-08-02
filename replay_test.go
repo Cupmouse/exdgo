@@ -1,6 +1,7 @@
 package exdgo
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -62,9 +63,24 @@ func TestReplayDownloadAndStream(t *testing.T) {
 		if line.Exchange != lines[i].Exchange {
 			t.Fatal("exchange differ")
 		}
-		// if bytes.Compare(line.Message, lines[i].Message) != 0 {
-		// 	t.Fatal("message differ")
-		// }
+		switch line.Message.(type) {
+		case []byte:
+			if bytes.Compare(line.Message.([]byte), lines[i].Message.([]byte)) != 0 {
+				t.Fatal("message differ")
+			}
+		case map[string]interface{}:
+			for name, val := range line.Message.(map[string]interface{}) {
+				va, ok := lines[i].Message.(map[string]interface{})[name]
+				if !ok {
+					t.Fatal("message differ: key does not exist")
+				}
+				if va != val {
+					t.Fatal("message differ: value differ")
+				}
+			}
+		default:
+			t.Fatal("default should not be called")
+		}
 		if line.Timestamp != lines[i].Timestamp {
 			t.Fatal("timestamp differ")
 		}
