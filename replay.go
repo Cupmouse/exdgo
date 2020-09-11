@@ -152,7 +152,7 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 	if exchange == "bitmex" {
 		if strings.IndexRune(channel, '_') == -1 {
 			// No underscore in the channel name
-			newChannel = fmt.Sprintf("%s_%s", channel, msgObj["pair"])
+			newChannel = fmt.Sprintf("%s_%s", channel, msgObj["symbol"])
 		}
 		// An underscore in the channel name is an unexpected case
 	}
