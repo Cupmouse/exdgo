@@ -115,13 +115,16 @@ type SnapshotParam struct {
 	At time.Time
 	// What format to get response in.
 	Format *string
+	// What channels to filter-in after the messages had been formatted.
+	PostFilter []string
 }
 
 type snapshotSetting struct {
-	exchange string
-	channels []string
-	at       int64
-	format   *string
+	exchange   string
+	channels   []string
+	at         int64
+	format     *string
+	postFilter []string
 }
 
 func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err error) {
@@ -130,13 +133,14 @@ func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err err
 		return
 	}
 	setting.exchange = param.Exchange
-	for _, ch := range setting.channels {
+	for _, ch := range param.Channels {
 		if !regexName.MatchString(ch) {
 			err = errors.New("invalid characters in 'Channels'")
 			return
 		}
 	}
 	setting.channels = param.Channels
+
 	setting.at = param.At.UnixNano()
 	// Optional parameter
 	if param.Format != nil {
@@ -145,6 +149,9 @@ func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err err
 			return
 		}
 		setting.format = param.Format
+	}
+	if param.PostFilter != nil {
+		setting.postFilter = param.PostFilter
 	}
 	return
 }
@@ -158,6 +165,9 @@ func httpSnapshot(ctx context.Context, cli *Client, setting snapshotSetting) ([]
 	// Optional parameter
 	if setting.format != nil {
 		params["format"] = []string{*setting.format}
+	}
+	if setting.postFilter != nil {
+		params["postFilter"] = setting.postFilter
 	}
 
 	// Send a request to server
@@ -260,16 +270,21 @@ type FilterParam struct {
 	// End date-time.
 	End *time.Time
 	// What format to get response in.
+	// Optional.
 	Format *string
+	// What channels to filter-in after the messages had been formatted.
+	// Optional. If nil, post filtering will be disabled, if not, the channels are filtered-in.
+	PostFilter []string
 }
 
 type filterSetting struct {
-	exchange string
-	channels []string
-	minute   int64
-	start    *int64
-	end      *int64
-	format   *string
+	exchange   string
+	channels   []string
+	minute     int64
+	start      *int64
+	end        *int64
+	format     *string
+	postFilter []string
 }
 
 func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
@@ -278,16 +293,13 @@ func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
 		return
 	}
 	setting.exchange = param.Exchange
-	for _, ch := range setting.channels {
+	for _, ch := range param.Channels {
 		if !regexName.MatchString(ch) {
-			err = errors.New("invalid characters in 'Exchange'")
+			err = errors.New("invalid characters in 'Channels'")
 			return
 		}
 	}
-	// Copy channels from original parameter
-	channels := make([]string, len(param.Channels))
-	copy(channels, param.Channels)
-	setting.channels = channels
+	setting.channels = param.Channels
 	setting.minute = param.Minute.Unix() / 60
 	// Optional parameter
 	var start int64
@@ -312,6 +324,15 @@ func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
 		}
 		setting.format = param.Format
 	}
+	if param.PostFilter != nil {
+		for _, ch := range param.PostFilter {
+			if !regexName.MatchString(ch) {
+				err = errors.New("invalid characters in 'PostFilter'")
+				return
+			}
+		}
+		setting.postFilter = param.PostFilter
+	}
 	return
 }
 
@@ -332,6 +353,9 @@ func httpFilter(ctx context.Context, cli *Client, setting filterSetting) ([]Stri
 	}
 	if setting.format != nil {
 		params["format"] = []string{*setting.format}
+	}
+	if setting.postFilter != nil {
+		params["postFilter"] = setting.postFilter
 	}
 	// Send a request to server
 	statusCode, body, serr := httpDownloadWithTimeout(ctx, cli, path, params)

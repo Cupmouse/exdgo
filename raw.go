@@ -19,6 +19,10 @@ type RawRequestParam struct {
 	// If you specify raw, then you will get result in raw format that the exchanges are providing with.
 	// If you specify json, then you will get result formatted in JSON format.
 	Format *string
+	// Map of exchanges and its channels to filter-in after their message had been formatted.
+	// Optional. If specified, post filtering will be enabled to filter-in the given channels,
+	// if not, disabled and all channels are unaffected.
+	PostFilter map[string][]string
 }
 
 // RawRequest replays market data in raw format.
@@ -27,22 +31,26 @@ type RawRequestParam struct {
 // - `download` to immidiately start downloading the whole response as one array.
 // - `stream` to return iterable object yields line by line.
 type RawRequest struct {
-	cli    *Client
-	filter map[string][]string
-	start  int64
-	end    int64
-	format *string
+	cli        *Client
+	filter     map[string][]string
+	start      int64
+	end        int64
+	format     *string
+	postFilter map[string][]string
 }
 
 // setupRawRequest validates parameter and creates new `RawRequest`.
 // req is nil if err is reported.
 func setupRawRequest(cli *Client, param RawRequestParam) (*RawRequest, error) {
+	if cli == nil {
+		return nil, errors.New("'cli' can not be nil")
+	}
 	req := new(RawRequest)
 	req.cli = cli
 	var serr error
 	req.filter, serr = copyFilter(param.Filter)
 	if serr != nil {
-		return nil, serr
+		return nil, fmt.Errorf("Filter: %v", serr)
 	}
 	start := param.Start.UnixNano()
 	end := param.End.UnixNano()
@@ -58,6 +66,12 @@ func setupRawRequest(cli *Client, param RawRequestParam) (*RawRequest, error) {
 			return nil, errors.New("invalid characters in 'Format'")
 		}
 		req.format = param.Format
+	}
+	if param.PostFilter != nil {
+		req.postFilter, serr = copyFilter(param.PostFilter)
+		if serr != nil {
+			return nil, fmt.Errorf("PostFilter: %v", serr)
+		}
 	}
 	return req, nil
 }
@@ -181,14 +195,19 @@ func (r *RawRequest) downloadAllShards(ctx context.Context, concurrency int) (ma
 	// Send jobs to worker
 	for exchange, channels := range r.filter {
 		// Take snapshot of channels
+		var postExcFilter []string
+		if r.postFilter != nil {
+			postExcFilter = r.postFilter[exchange]
+		}
 		// FIXME Can change to blocking one if we use select
 		jobsCh <- &rawDownloadJob{
 			typ: rawDownloadJobSnapshot,
 			setting: snapshotSetting{
-				exchange: exchange,
-				channels: channels,
-				at:       r.start,
-				format:   r.format,
+				exchange:   exchange,
+				channels:   channels,
+				at:         r.start,
+				format:     r.format,
+				postFilter: postExcFilter,
 			},
 		}
 
@@ -197,12 +216,13 @@ func (r *RawRequest) downloadAllShards(ctx context.Context, concurrency int) (ma
 			jobsCh <- &rawDownloadJob{
 				typ: rawDonwloadJobFilter,
 				setting: filterSetting{
-					exchange: exchange,
-					channels: channels,
-					start:    &r.start,
-					end:      &r.end,
-					minute:   minute,
-					format:   r.format,
+					exchange:   exchange,
+					channels:   channels,
+					start:      &r.start,
+					end:        &r.end,
+					minute:     minute,
+					format:     r.format,
+					postFilter: postExcFilter,
 				},
 			}
 		}
@@ -364,12 +384,16 @@ type rawExchangeStreamShardIterator struct {
 }
 
 func (i *rawExchangeStreamShardIterator) downloadSnapshot(ctx context.Context, results chan *rawStreamShardResult) {
-	result, serr := httpSnapshot(ctx, i.request.cli, snapshotSetting{
+	ss := snapshotSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		at:       i.request.start,
 		format:   i.request.format,
-	})
+	}
+	if i.request.postFilter != nil {
+		ss.postFilter = i.request.postFilter[i.exchange]
+	}
+	result, serr := httpSnapshot(ctx, i.request.cli, ss)
 	if serr != nil {
 		results <- &rawStreamShardResult{err: serr}
 	}
@@ -380,14 +404,18 @@ func (i *rawExchangeStreamShardIterator) downloadSnapshot(ctx context.Context, r
 }
 
 func (i *rawExchangeStreamShardIterator) downloadFilter(ctx context.Context, minute int64, index int, results chan *rawStreamShardResult) {
-	result, serr := httpFilter(ctx, i.request.cli, filterSetting{
+	fs := filterSetting{
 		exchange: i.exchange,
 		channels: i.request.filter[i.exchange],
 		minute:   minute,
 		start:    &i.request.start,
 		end:      &i.request.end,
 		format:   i.request.format,
-	})
+	}
+	if i.request.postFilter != nil {
+		fs.postFilter = i.request.postFilter[i.exchange]
+	}
+	result, serr := httpFilter(ctx, i.request.cli, fs)
 	if serr != nil {
 		results <- &rawStreamShardResult{err: serr}
 	}

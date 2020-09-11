@@ -65,11 +65,40 @@ func convertReplayFilterToRawFilter(filter map[string][]string) map[string][]str
 					ri = len(ch)
 				}
 				prefix := ch[:ri]
-				_, ok := set[prefix]
-				if !ok {
+
+				if _, ok := set[prefix]; !ok {
 					// Not present in the slice
 					list = append(list, prefix)
 					set[prefix] = true
+				}
+			}
+			newFilter[exchange] = list
+		} else {
+			newFilter[exchange] = channels
+		}
+	}
+	return newFilter
+}
+
+func convertReplayFilterToRawPostFilter(postFilter map[string][]string) map[string][]string {
+	newFilter := make(map[string][]string)
+	for exchange, channels := range postFilter {
+		if exchange == "bitmex" {
+			// Construct unique list of raw channels
+			list := make([]string, 0, len(channels))
+			set := make(map[string]bool)
+			for _, ch := range channels {
+				if _, ok := set[ch]; !ok {
+					// Not present in the slice
+					list = append(list, ch)
+					set[ch] = true
+				}
+				if ri := strings.IndexRune(ch, '_'); ri != -1 {
+					prefix := ch[:ri]
+					if _, ok := set[prefix]; !ok {
+						list = append(list, prefix)
+						set[ch] = true
+					}
 				}
 			}
 			newFilter[exchange] = list
@@ -190,11 +219,12 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 func (r *ReplayRequest) DownloadWithContext(ctx context.Context, concurrency int) ([]StructLine, error) {
 	format := "json"
 	rawReq := RawRequest{
-		cli:    r.cli,
-		filter: convertReplayFilterToRawFilter(r.filter),
-		start:  r.start,
-		end:    r.end,
-		format: &format,
+		cli:        r.cli,
+		filter:     convertReplayFilterToRawFilter(r.filter),
+		start:      r.start,
+		end:        r.end,
+		format:     &format,
+		postFilter: convertReplayFilterToRawPostFilter(r.filter),
 	}
 	slice, serr := rawReq.DownloadWithContext(ctx, concurrency)
 	if serr != nil {
@@ -237,11 +267,12 @@ func newReplayStreamIterator(ctx context.Context, req *ReplayRequest, bufferSize
 	i := new(replayStreamIterator)
 	format := "json"
 	rawRequest := RawRequest{
-		cli:    req.cli,
-		filter: convertReplayFilterToRawFilter(req.filter),
-		start:  req.start,
-		end:    req.end,
-		format: &format,
+		cli:        req.cli,
+		filter:     convertReplayFilterToRawFilter(req.filter),
+		start:      req.start,
+		end:        req.end,
+		format:     &format,
+		postFilter: convertReplayFilterToRawPostFilter(req.filter),
 	}
 	itr, serr := rawRequest.StreamWithContext(ctx, bufferSize)
 	if serr != nil {
