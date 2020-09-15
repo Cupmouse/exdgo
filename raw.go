@@ -396,6 +396,7 @@ func (i *rawExchangeStreamShardIterator) downloadSnapshot(ctx context.Context, r
 	result, serr := httpSnapshot(ctx, i.request.cli, ss)
 	if serr != nil {
 		results <- &rawStreamShardResult{err: serr}
+		return
 	}
 	results <- &rawStreamShardResult{
 		index: 0,
@@ -418,6 +419,7 @@ func (i *rawExchangeStreamShardIterator) downloadFilter(ctx context.Context, min
 	result, serr := httpFilter(ctx, i.request.cli, fs)
 	if serr != nil {
 		results <- &rawStreamShardResult{err: serr}
+		return
 	}
 	results <- &rawStreamShardResult{
 		index: index,
