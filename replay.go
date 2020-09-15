@@ -110,23 +110,12 @@ func convertReplayFilterToRawPostFilter(postFilter map[string][]string) map[stri
 }
 
 type rawLineProcessor struct {
-	// map[exchange]map[channel]in_set
-	postFilter map[string]map[string]bool
 	// map[exchange]map[channel]map[field]type
 	defs map[string]map[string]map[string]string
 }
 
-func newRawLineProcessor(filter map[string][]string) *rawLineProcessor {
+func newRawLineProcessor() *rawLineProcessor {
 	p := new(rawLineProcessor)
-	// Using map for a set is faster
-	p.postFilter = make(map[string]map[string]bool)
-	for exchange, channels := range filter {
-		p.postFilter[exchange] = make(map[string]bool)
-		for _, ch := range channels {
-			// Value is meaningless
-			p.postFilter[exchange][ch] = true
-		}
-	}
 	p.defs = make(map[string]map[string]map[string]string)
 	return p
 }
@@ -153,16 +142,14 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 	channel := *line.Channel
 	message := line.Message
 
-	_, sok := p.defs[exchange]
-	if !sok {
+	if _, sok := p.defs[exchange]; !sok {
 		// This is the first line for this exchange
 		p.defs[exchange] = make(map[string]map[string]string)
 	}
 	def, sok := p.defs[exchange][channel]
 	if !sok {
 		def = make(map[string]string)
-		serr := json.Unmarshal(message, &def)
-		if serr != nil {
+		if serr := json.Unmarshal(message, &def); serr != nil {
 			err = fmt.Errorf("def update unmarshal: %v", serr)
 			return
 		}
@@ -173,21 +160,6 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 	serr := json.Unmarshal(message, &msgObj)
 	if serr != nil {
 		err = fmt.Errorf("message unmarshal: %v", serr)
-		return
-	}
-
-	// Channel name change and post filtering
-	newChannel := channel
-	if exchange == "bitmex" {
-		if strings.IndexRune(channel, '_') == -1 {
-			// No underscore in the channel name
-			newChannel = fmt.Sprintf("%s_%s", channel, msgObj["symbol"])
-		}
-		// An underscore in the channel name is an unexpected case
-	}
-	_, sok = p.postFilter[exchange][newChannel]
-	if !sok {
-		// This channel should be excluded
 		return
 	}
 
@@ -231,7 +203,7 @@ func (r *ReplayRequest) DownloadWithContext(ctx context.Context, concurrency int
 		return nil, serr
 	}
 	result := make([]StructLine, 0, len(slice))
-	processor := newRawLineProcessor(r.filter)
+	processor := newRawLineProcessor()
 	for i := range slice {
 		processed, ok, serr := processor.processRawLine(&slice[i])
 		if !ok {
@@ -279,7 +251,7 @@ func newReplayStreamIterator(ctx context.Context, req *ReplayRequest, bufferSize
 		return nil, serr
 	}
 	i.rawItr = itr
-	i.processor = newRawLineProcessor(req.filter)
+	i.processor = newRawLineProcessor()
 	return i, nil
 }
 
