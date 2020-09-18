@@ -115,16 +115,13 @@ type SnapshotParam struct {
 	At time.Time
 	// What format to get response in.
 	Format *string
-	// What channels to filter-in after the messages had been formatted.
-	PostFilter []string
 }
 
 type snapshotSetting struct {
-	exchange   string
-	channels   []string
-	at         int64
-	format     *string
-	postFilter []string
+	exchange string
+	channels []string
+	at       int64
+	format   *string
 }
 
 func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err error) {
@@ -150,9 +147,6 @@ func setupSnapshotSetting(param SnapshotParam) (setting snapshotSetting, err err
 		}
 		setting.format = param.Format
 	}
-	if param.PostFilter != nil {
-		setting.postFilter = param.PostFilter
-	}
 	return
 }
 
@@ -165,9 +159,6 @@ func httpSnapshot(ctx context.Context, cli *Client, setting snapshotSetting) ([]
 	// Optional parameter
 	if setting.format != nil {
 		params["format"] = []string{*setting.format}
-	}
-	if setting.postFilter != nil {
-		params["postFilter"] = setting.postFilter
 	}
 
 	// Send a request to server
@@ -272,19 +263,15 @@ type FilterParam struct {
 	// What format to get response in.
 	// Optional.
 	Format *string
-	// What channels to filter-in after the messages had been formatted.
-	// Optional. If nil, post filtering will be disabled, if not, the channels are filtered-in.
-	PostFilter []string
 }
 
 type filterSetting struct {
-	exchange   string
-	channels   []string
-	minute     int64
-	start      *int64
-	end        *int64
-	format     *string
-	postFilter []string
+	exchange string
+	channels []string
+	minute   int64
+	start    *int64
+	end      *int64
+	format   *string
 }
 
 func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
@@ -324,15 +311,6 @@ func setupFilterSetting(param FilterParam) (setting filterSetting, err error) {
 		}
 		setting.format = param.Format
 	}
-	if param.PostFilter != nil {
-		for _, ch := range param.PostFilter {
-			if !regexName.MatchString(ch) {
-				err = errors.New("invalid characters in 'PostFilter'")
-				return
-			}
-		}
-		setting.postFilter = param.PostFilter
-	}
 	return
 }
 
@@ -353,9 +331,6 @@ func httpFilter(ctx context.Context, cli *Client, setting filterSetting) ([]Stri
 	}
 	if setting.format != nil {
 		params["format"] = []string{*setting.format}
-	}
-	if setting.postFilter != nil {
-		params["postFilter"] = setting.postFilter
 	}
 	// Send a request to server
 	statusCode, body, serr := httpDownloadWithTimeout(ctx, cli, path, params)
