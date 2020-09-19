@@ -116,11 +116,12 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 	}
 
 	ret = StructLine{
-		Exchange:  exchange,
-		Type:      line.Type,
-		Timestamp: line.Timestamp,
-		Channel:   line.Channel,
-		Message:   msgObj,
+		Exchange:   exchange,
+		Type:       line.Type,
+		Timestamp:  line.Timestamp,
+		Channel:    line.Channel,
+		Message:    msgObj,
+		Definition: def,
 	}
 	ok = true
 	return

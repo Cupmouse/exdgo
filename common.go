@@ -59,6 +59,10 @@ type StructLine struct {
 	Timestamp int64
 	Channel   *string
 	Message   interface{}
+	// Definition of message.
+	// Could be nil.
+	// Do not modify.
+	Definition map[string]string
 }
 
 // StringLine is the data structure of a single line from a response.
