@@ -10,7 +10,7 @@ func prepareReplayRequest(t *testing.T) *ReplayRequest {
 	cli := ClientParam{
 		APIKey: "demo",
 	}
-	start, serr := time.Parse(time.RFC3339, "2020-01-01T00:00:10Z")
+	start, serr := time.Parse(time.RFC3339, "2020-01-01T00:00:00Z")
 	if serr != nil {
 		t.Fatalf("testing error: %v", serr)
 	}
