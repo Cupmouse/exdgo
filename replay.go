@@ -105,12 +105,15 @@ func (p *rawLineProcessor) processRawLine(line *StringLine) (ret StructLine, ok 
 
 	// Type conversion according to the received definition
 	for name, typ := range def {
-		val, sok := msgObj[name]
-		if (typ == "timestamp" || typ == "duration") && sok {
-			msgObj[name], serr = strconv.ParseInt(val.(string), 10, 64)
-			if serr != nil {
-				err = fmt.Errorf("type conversion: %v", serr)
-				return
+		if val, sok := msgObj[name]; sok && val != nil {
+			if typ == "timestamp" || typ == "duration" {
+				msgObj[name], serr = strconv.ParseInt(val.(string), 10, 64)
+				if serr != nil {
+					err = fmt.Errorf("type conversion: %v", serr)
+					return
+				}
+			} else if typ == "int" {
+				msgObj[name] = int64(val.(float64))
 			}
 		}
 	}

@@ -446,7 +446,7 @@ func (i *rawExchangeStreamShardIterator) background(ctx context.Context, out cha
 	// Set this flag true to stop this loop
 	stop := false
 	for !stop {
-		if buffer[position] == nil {
+		if buffer[position%i.bufferSize] == nil {
 			select {
 			case res := <-results:
 				// Got a result or an error
@@ -475,8 +475,8 @@ func (i *rawExchangeStreamShardIterator) background(ctx context.Context, out cha
 					cancelDLCtx()
 				}
 				buffer[res.index%i.bufferSize] = res.shard
-			case out <- buffer[position]:
-				buffer[position] = nil
+			case out <- buffer[position%i.bufferSize]:
+				buffer[position%i.bufferSize] = nil
 				if nextMinute <= endMinute {
 					go i.downloadFilter(downloadCtx, nextMinute, int(nextMinute-startMinute+1), results)
 					nextMinute++
